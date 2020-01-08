@@ -8,11 +8,13 @@ import fault.value_utils as value_utils
 from fault.select_path import SelectPath
 from fault.wrapper import PortWrapper
 from fault.subprocess_run import subprocess_run
+from fault.background_poke import process_action_list
 import fault
 import fault.expression as expression
 from fault.real_type import RealKind
 import os
 from numbers import Number
+import re
 
 
 src_tpl = """\
@@ -38,12 +40,13 @@ class SystemVerilogTarget(VerilogTarget):
     def __init__(self, circuit, circuit_name=None, directory="build/",
                  skip_compile=None, magma_output="coreir-verilog",
                  magma_opts=None, include_verilog_libraries=None,
-                 simulator=None, timescale="1ns/1ns", clock_step_delay=5,
+                 simulator=None, timescale="1ns/1ns", clock_step_delay=5e-9,
                  num_cycles=10000, dump_vcd=True, no_warning=False,
                  sim_env=None, ext_model_file=None, ext_libs=None,
                  defines=None, flags=None, inc_dirs=None,
                  ext_test_bench=False, top_module=None, ext_srcs=None,
-                 use_input_wires=False, parameters=None, disp_type='on_error'):
+                 use_input_wires=False, parameters=None, disp_type='on_error',
+                 read_tag='fault_read<{read_hash}><{value}>'):
         """
         circuit: a magma circuit
 
@@ -115,6 +118,9 @@ class SystemVerilogTarget(VerilogTarget):
         disp_type: 'on_error', 'realtime'.  If 'on_error', only print if there
                    is an error.  If 'realtime', print out STDOUT as lines come
                    in, then print STDERR after the process completes.
+
+        read_tag: Text tag for formatting read action hashes and values dumped
+                  by the simulator.
         """
         # set default for list of external sources
         if include_verilog_libraries is None:
@@ -146,6 +152,9 @@ class SystemVerilogTarget(VerilogTarget):
         if simulator not in {"vcs", "ncsim", "iverilog"}:
             raise ValueError(f"Unsupported simulator {simulator}")
 
+        # dictionary of Read actions that will need their 'value's set
+        self.read_dict = {}
+
         # save settings
         self.simulator = simulator
         self.timescale = timescale
@@ -165,6 +174,7 @@ class SystemVerilogTarget(VerilogTarget):
         self.use_input_wires = use_input_wires
         self.parameters = parameters if parameters is not None else {}
         self.disp_type = disp_type
+        self.read_tag = read_tag
 
     def add_decl(self, *decls):
         self.declarations.extend(decls)
@@ -256,7 +266,7 @@ class SystemVerilogTarget(VerilogTarget):
         return retval
 
     def make_delay(self, i, action):
-        return [f'#({action.time}*1s);']
+        return [f'$write("MAKING DELAY\\n"); #({action.time}*1s);']
 
     def make_print(self, i, action):
         # build up argument list for the $write command
@@ -269,6 +279,46 @@ class SystemVerilogTarget(VerilogTarget):
                 args.append(f'{self.make_name(port)}')
         args = ', '.join(args)
         return [f'$write({args});']
+
+    def make_read(self, i, action):
+        # yes it's weird that we are using a hash of something as its key,
+        # but we only get back the text of the hash so I think this is the
+        # best way to get the object back from that text
+        self.read_dict[hash(action)] = action
+
+        type_ = type(action.port)
+        if isinstance(type_, m.ArrayKind):
+            # TODO
+            raise NotImplementedError
+        elif isinstance(type_, RealKind):
+            format_string = '%f'
+        else:
+            format_string = '%d'
+        text = self.read_tag.format(read_hash = hash(action), 
+                value = format_string)
+        #text += '\n'
+
+        # give this the attributes of a read action
+        action.format_str = text
+        action.ports = [action.port]
+        return self.make_print(i, action)
+
+    def process_reads(self, text):
+        def unstring(s):
+            try:
+                return int(s)
+            except ValueError:
+                pass
+            try:
+                return float(s)
+            except ValueError:
+                pass
+            raise NotImplementedError(f'Cannot interpret value "{s}"')
+
+        regex = self.read_tag.format(read_hash='(.*?)', value='(.*?)')
+        for read_hash, value_str in re.findall(regex, text):
+            value = unstring(value_str)
+            self.read_dict[int(read_hash)].value = value
 
     def make_loop(self, i, action):
         self.declarations.append(f"integer {action.loop_var};")
@@ -535,6 +585,9 @@ end
         # set defaults
         power_args = power_args if power_args is not None else {}
 
+        # expand background pokes into regular pokes
+        actions = process_action_list(actions, self.clock_step_delay)
+
         # assemble list of sources files
         vlog_srcs = []
         if not self.ext_test_bench:
@@ -566,13 +619,16 @@ end
         sim_cmd += self.flags
 
         # compile the simulation
-        subprocess_run(sim_cmd, cwd=self.directory, env=self.sim_env,
+        print('calling subprocess with args', sim_cmd, self.directory, self.sim_env, self.disp_type)
+        completed_sim = subprocess_run(sim_cmd, cwd=self.directory, env=self.sim_env,
                        disp_type=self.disp_type)
 
         # run the simulation binary (if applicable)
         if bin_cmd is not None:
-            subprocess_run(bin_cmd, cwd=self.directory, env=self.sim_env,
+            completed_sim = subprocess_run(bin_cmd, cwd=self.directory, env=self.sim_env,
                            err_str=sim_err_str, disp_type=self.disp_type)
+        result_text = completed_sim.stdout
+        self.process_reads(result_text)
 
     def write_test_bench(self, actions, power_args):
         # determine the path of the testbench file

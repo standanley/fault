@@ -46,11 +46,12 @@ def is_input(port):
 
 
 class Poke(PortAction):
-    def __init__(self, port, value, delay=None):
+    def __init__(self, port, value, delay=None, background_params=None):
         if is_input(port):
             raise ValueError(f"Can only poke inputs: {port.debug_name} "
                              f"{type(port)}")
         self.delay = delay
+        self.background_params = background_params
         super().__init__(port, value)
 
 
@@ -70,6 +71,31 @@ class Print(Action):
         new_ports = (new_circuit.interface.ports[str(port.name)] for port in
                      self.ports)
         return cls(self.format_str, *new_ports)
+
+
+class Read(Action):
+    def __init__(self, port, style='single', params={}):
+        super().__init__()
+        self.port = port
+        self.style = style
+        self.params = params
+
+    def __getattr__(self, name):
+        if name == 'value':
+            err_msg = f'value has not been set for {self}'
+            err_msg += ', did the simulation finish running yet?'
+            assert False, err_msg
+        else:
+            raise AttributeError
+
+    def __str__(self):
+        return f"Read({self.port.debug_name})"
+
+    def retarget(self, new_circuit, clock):
+        cls = type(self)
+        new_port = new_circuit.interface.ports[str(self.port.name)]
+        return cls(new_port)
+
 
 
 def is_inout(port):
@@ -92,7 +118,7 @@ def is_output(port):
 
 class Expect(PortAction):
     def __init__(self, port, value, strict=False, abs_tol=None, rel_tol=None,
-                 above=None, below=None):
+                 above=None, below=None, save_for_later=False):
         # call super constructor
         super().__init__(port, value)
 
@@ -116,6 +142,7 @@ class Expect(PortAction):
         self.strict = strict
         self.above = above
         self.below = below
+        self.save_for_later = save_for_later
 
 
 class Assume(PortAction):

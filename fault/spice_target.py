@@ -4,14 +4,16 @@ from copy import copy
 import magma as m
 import fault
 import hwtypes
+import numpy as np
 from fault.target import Target
 from fault.spice import SpiceNetlist
 from fault.nutascii_parse import nutascii_parse
 from fault.psf_parse import psf_parse
 from fault.subprocess_run import subprocess_run
 from fault.pwl import pwc_to_pwl
-from fault.actions import Poke, Expect, Delay, Print
+from fault.actions import Poke, Expect, Delay, Print, Read
 from fault.select_path import SelectPath
+from fault.background_poke import process_action_list
 
 
 # define a custom error for A2D conversion to make it easier
@@ -20,12 +22,16 @@ from fault.select_path import SelectPath
 class A2DError(Exception):
     pass
 
+# edge finder is used for measuring phase, freq, etc.
+class EdgeNotFoundError(Exception):
+    pass
 
 class CompiledSpiceActions:
-    def __init__(self, pwls, checks, prints, stop_time, saves):
+    def __init__(self, pwls, checks, prints, reads, stop_time, saves):
         self.pwls = pwls
         self.checks = checks
         self.prints = prints
+        self.reads = reads
         self.stop_time = stop_time
         self.saves = saves
 
@@ -33,7 +39,7 @@ class CompiledSpiceActions:
 class SpiceTarget(Target):
     def __init__(self, circuit, directory="build/", simulator='ngspice',
                  vsup=1.0, rout=1, model_paths=None, sim_env=None,
-                 t_step=None, clock_step_delay=5, t_tr=0.2e-9, vil_rel=0.4,
+                 t_step=None, clock_step_delay=5e-9, t_tr=0.2e-9, vil_rel=0.4,
                  vih_rel=0.6, rz=1e9, conn_order='alpha', bus_delim='<>',
                  bus_order='descend', flags=None, ic=None,
                  disp_type='on_error'):
@@ -118,7 +124,13 @@ class SpiceTarget(Target):
         self.ic = ic if ic is not None else {}
         self.disp_type = disp_type
 
+        # place for saving expects that were "save_for_later"
+        self.saved_for_later = []
+
     def run(self, actions):
+        # expand background pokes into regular pokes
+        actions = process_action_list(actions, self.clock_step_delay)
+
         # compile the actions
         comp = self.compile_actions(actions)
 
@@ -137,8 +149,13 @@ class SpiceTarget(Target):
 
         # run the simulation commands
         for sim_cmd in sim_cmds:
-            subprocess_run(sim_cmd, cwd=self.directory, env=self.sim_env,
+            res = subprocess_run(sim_cmd, cwd=self.directory, env=self.sim_env,
                            disp_type=self.disp_type)
+            #print(res.stdout)
+            stderr = res.stderr.strip()
+            if stderr != '':
+                print('Stderr from spice simulator:')
+                print(stderr)
 
         # process the results
         if self.simulator in {'ngspice', 'spectre'}:
@@ -148,8 +165,21 @@ class SpiceTarget(Target):
         else:
             raise NotImplementedError(self.simulator)
 
+        #import matplotlib.pyplot as plt
+        #print(results.keys())
+        #print('HELLO')
+        #in_ = results['in_']
+        #out = results['out']
+        #plt.plot(in_.x, in_.y, '-o')
+        #plt.plot(out.x, out.y, '-o')
+        #plt.grid()
+        #plt.show()
+
         # print results
         self.print_results(results=results, prints=comp.prints)
+
+        # set values on reads
+        self.process_reads(results, comp.reads)
 
         # check results
         self.check_results(results=results, checks=comp.checks)
@@ -191,14 +221,19 @@ class SpiceTarget(Target):
         pwc_dict = {}
         checks = []
         prints = []
+        reads = []
         saves = set()
 
         # expand buses as needed
         _actions = []
         for action in actions:
-            if isinstance(action, (Poke, Expect)) \
+            if isinstance(action, (Poke, Expect, Read)) \
                and isinstance(action.port, m.BitsType):
                 _actions += self.expand_bus(action)
+            elif (isinstance(action, (Poke, Expect, Read))
+                  and isinstance(action.port.name, m.ref.ArrayRef)):
+                action.port = self.select_bit_from_bus(action.port)
+                _actions.append(action)
             else:
                 _actions.append(action)
         actions = _actions
@@ -227,7 +262,7 @@ class SpiceTarget(Target):
                 pwc_dict[action_port_name][1].append((t, stim_s))
                 # increment time if desired
                 if action.delay is None:
-                    t += self.clock_step_delay * 1e-9
+                    t += self.clock_step_delay
                 else:
                     t += action.delay
             elif isinstance(action, Expect):
@@ -237,6 +272,15 @@ class SpiceTarget(Target):
                 prints.append((t, action))
                 for port in action.ports:
                     saves.add(f'{port.name}')
+            elif isinstance(action, Read):
+                reads.append((t, action))
+                saves.add(f'{action.port.name}')
+                # phase could be relative to another signal
+                if 'ref' in action.params:
+                    if isinstance(action.params['ref'].name, m.ref.ArrayRef):
+                        ref = self.select_bit_from_bus(action.params['ref'])
+                        action.params['ref'] = ref
+                    saves.add(f'{action.params["ref"].name}')
             elif isinstance(action, Delay):
                 t += action.time
             else:
@@ -255,6 +299,7 @@ class SpiceTarget(Target):
             pwls=pwls,
             checks=checks,
             prints=prints,
+            reads=reads,
             stop_time=t,
             saves=saves
         )
@@ -280,6 +325,17 @@ class SpiceTarget(Target):
             return f'{port}_{k}'
         else:
             raise Exception(f'Unknown bus delimeter: {self.bus_delim}')
+
+    def select_bit_from_bus(self, port):
+        # The default way magma deals with naming one pin of a bus
+        # does not match our spice convention. We need to get the
+        # name of the original bus and index it ourselves.
+        bus_name = port.name.array.name
+        bus_index = port.name.index
+        bit_name = self.bit_from_bus(bus_name, bus_index)
+        new_port = m.BitType(name=bit_name)
+        return new_port
+
 
     def get_alpha_ordered_ports(self):
         # get ports sorted in alphabetical order
@@ -397,6 +453,11 @@ class SpiceTarget(Target):
             else:
                 raise A2DError(f'Invalid logic level: {value}.')
 
+        if action.save_for_later:
+            # save the value and don't check
+            self.saved_for_later.append(value)
+            return
+
         # implement the requested check
         if action.above is not None:
             if action.below is not None:
@@ -422,6 +483,81 @@ class SpiceTarget(Target):
     def print_results(self, results, prints):
         for print_ in prints:
             self.impl_print(results=results, time=print_[0], action=print_[1])
+
+    def process_reads(self, results, reads):
+        for time, read in reads:
+            res = results[f'{read.port.name}']
+            if read.style == 'single':
+                value = res(time)
+                if type(value) == np.ndarray:
+                    value = value.tolist()
+                read.value = value
+            elif read.style == 'edge':
+                value = self.find_edge(res.x, res.y, time, **read.params)
+                read.value = value
+            elif read.style == 'phase':
+                assert 'ref' in read.params, 'Phase read requires reference signal param'
+                res_ref = results[f'{read.params["ref"].name}']
+                ref = self.find_edge(res_ref.x, res_ref.y, time, count=2)
+                before_cycle_end = self.find_edge(res.x, res.y, time + ref[0])
+                fraction = 1 + before_cycle_end[0] / (ref[0] -ref[1])
+                # TODO multiply by 2pi?
+                read.value = fraction
+            else:
+                raise NotImplementedError(f'Unknown read style "{read.style}"')
+
+    def find_edge(self, x, y, t_start, height=None, forward=False, count=1, rising=True):
+        '''
+        Search through data (x,y) starting at time t_start for when the
+        waveform crosses height (defaut is ???). Searches backwards by
+        default (frequency now is probably based on the last few edges?)
+        '''
+
+        if height is None:
+            # default comes out to 0.5
+            height = self.vsup * (self.vih_rel + self.vil_rel) / 2
+
+        # deal with `rising` and `forward`
+        # normally a low-to-high finder
+        if (rising ^ forward):
+            y = [(-1*z + 2*height) for z in y]
+        direction = 1 if forward else -1
+        # we want to start on the far side of the interval containing t_start
+        # to make sure we catch any edge near t_start
+        side = 'left' if forward else 'right'
+
+        start_index = np.searchsorted(x, t_start, side=side)
+        if start_index == len(x):
+            # happens when forward=False and the edge find is the end of the sim
+            start_index -= 1
+
+        i = start_index
+        edges = []
+        while len(edges) < count:
+            # move until we hit low
+            while y[i] > height:
+                i += direction
+                if i < 0 or i >= len(y):
+                    msg = f'only {len(edges)} of requested {count} edges found'
+                    raise EdgeNotFoundError(msg)
+            # now move until we hit the high
+            while y[i] <= height:
+                i += direction
+                if i < 0 or i >= len(y):
+                    msg = f'only {len(edges)} of requested {count} edges found'
+                    raise EdgeNotFoundError(msg)
+
+
+            # TODO: there's an issue because of the discrepancy between the requested
+            # start time and actually staring at the nearest edge
+
+            # the crossing happens from i to i+1
+            fraction = (height-y[i]) / (y[i-direction]-y[i])
+            t = x[i] + fraction * (x[i+1] - x[i])
+            if t==t_start:
+                print('EDGE EXACTLY AT EDGE FIND REQUEST')
+            edges.append(t-t_start)
+        return edges
 
     def ngspice_cmds(self, tb_file):
         # build up the command
